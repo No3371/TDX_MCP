@@ -152,6 +152,12 @@ class AdmissionQueue:
             ticket.last_seen = self._clock()
             return self._status_locked(ticket)
 
+    def waiting(self) -> int:
+        """How many tokens are still in line."""
+        with self._lock:
+            self._drain()
+            return self._issued - self._admitted
+
     def stats(self) -> dict:
         with self._lock:
             self._drain()

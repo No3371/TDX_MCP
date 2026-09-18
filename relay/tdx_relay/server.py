@@ -19,16 +19,11 @@ from .admission import AdmissionQueue
 from .config import Settings
 from .gate import Gate
 from .http import ClientIPMiddleware, client_ip
+from .meter import RateMeter
 from .ratelimit import RateLimiter
 from .tdx import TDXClient, UpstreamError
 
 TAIPEI = ZoneInfo("Asia/Taipei")
-
-TOKEN_DOC = (
-    "Queue token from an earlier call. Omit it on the first call: the relay "
-    "mints one, puts it in line and returns it with your queue position."
-)
-
 
 def _today() -> str:
     return datetime.now(TAIPEI).strftime("%Y-%m-%d")
@@ -44,16 +39,18 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
         queue_limit=settings.queue_limit,
     )
     limiter = RateLimiter(burst=settings.ip_issue_burst, rate=settings.ip_issue_rate)
-    gate = Gate(queue, limiter)
+    meter = RateMeter(window=settings.load_window)
+    gate = Gate(queue, limiter, meter, bypass_threshold=settings.bypass_threshold)
     tdx = TDXClient(settings)
 
     mcp = MCPServer(
         name="tdx-relay",
         instructions=(
-            "Open relay for TDX transport data. Every tool takes an optional "
-            "'token'. Call once without a token to receive one plus your queue "
-            "position, wait the returned number of seconds, then call again "
-            "with the same token. Reuse that token for all later calls."
+            "Open relay for TDX transport data. While the relay is quiet, call "
+            "the tools directly: no token is needed. When it is busy a call "
+            "without a token comes back with status 'queued', a token and a "
+            "wait in seconds; wait that long, then call again with the same "
+            "token and reuse it for every later call."
         ),
     )
 
@@ -65,7 +62,11 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
             data = await fetch()
         except UpstreamError as exc:
             return {"status": "upstream_error", "token": decision.token, "reason": str(exc)}
-        result = {"status": "ok", "token": decision.token, **data}
+        result = {"status": "ok", **data}
+        if decision.bypassed:
+            result["served_directly"] = True
+        else:
+            result["token"] = decision.token
         if decision.new_token:
             result["new_token"] = True
             result["hint"] = "Reuse this token on every later call to stay out of the queue."
@@ -74,18 +75,27 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
     # -- queue ----------------------------------------------------------
     @mcp.tool()
     async def queue_status(token: Optional[str] = None) -> Dict[str, Any]:
-        """Get a queue token, or check where an existing token stands.
+        """Check whether the relay needs a token right now, and get one if so.
 
         Args:
-            token: Queue token from an earlier call, or omit to get a new one.
+            token: Queue token, if an earlier call returned one. Omit it otherwise. Omit it unless the relay asked for one.
         """
         decision = gate.admit(token, client_ip())
         if not decision.admitted:
             return decision.payload
+        if decision.bypassed:
+            return {
+                "status": "open",
+                "message": "The relay is quiet, so no token is needed. Call the tools directly.",
+                "requests_per_second": round(gate.load(), 2),
+                "bypass_below_requests_per_second": gate.bypass_threshold,
+                **queue.stats(),
+            }
         return {
             "status": "admitted",
             "token": decision.token,
             "new_token": decision.new_token,
+            "requests_per_second": round(gate.load(), 2),
             **queue.stats(),
         }
 
@@ -96,7 +106,7 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
 
         Args:
             keyword: Part of the station name in Chinese.
-            token: Queue token from an earlier call.
+            token: Queue token, if an earlier call returned one. Omit it otherwise.
         """
 
         async def fetch():
@@ -118,7 +128,7 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
             origin: Origin station ID, from find_tra_station.
             destination: Destination station ID, from find_tra_station.
             date: Travel date as YYYY-MM-DD. Defaults to today in Taipei.
-            token: Queue token from an earlier call.
+            token: Queue token, if an earlier call returned one. Omit it otherwise.
         """
 
         async def fetch():
@@ -143,7 +153,7 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
         Args:
             origin: Origin station ID, from find_tra_station.
             destination: Destination station ID, from find_tra_station.
-            token: Queue token from an earlier call.
+            token: Queue token, if an earlier call returned one. Omit it otherwise.
         """
 
         async def fetch():
@@ -161,7 +171,7 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
 
         Args:
             keyword: Part of the station name in Chinese.
-            token: Queue token from an earlier call.
+            token: Queue token, if an earlier call returned one. Omit it otherwise.
         """
 
         async def fetch():
@@ -183,7 +193,7 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
             origin: Origin station ID, from find_thsr_station.
             destination: Destination station ID, from find_thsr_station.
             date: Travel date as YYYY-MM-DD. Defaults to today in Taipei.
-            token: Queue token from an earlier call.
+            token: Queue token, if an earlier call returned one. Omit it otherwise.
         """
 
         async def fetch():
@@ -208,7 +218,7 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
         Args:
             origin: Origin station ID, from find_thsr_station.
             destination: Destination station ID, from find_thsr_station.
-            token: Queue token from an earlier call.
+            token: Queue token, if an earlier call returned one. Omit it otherwise.
         """
 
         async def fetch():
@@ -226,7 +236,7 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
 
         Args:
             city: City in TDX spelling, e.g. 'Taipei', 'Taoyuan', 'Kaohsiung'.
-            token: Queue token from an earlier call.
+            token: Queue token, if an earlier call returned one. Omit it otherwise.
         """
 
         async def fetch():
@@ -240,7 +250,7 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
         """Road events on provincial highways. Returns at most 5 events.
 
         Args:
-            token: Queue token from an earlier call.
+            token: Queue token, if an earlier call returned one. Omit it otherwise.
         """
 
         async def fetch():
@@ -254,7 +264,7 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
         """Road events on freeways (國道). Returns at most 5 events.
 
         Args:
-            token: Queue token from an earlier call.
+            token: Queue token, if an earlier call returned one. Omit it otherwise.
         """
 
         async def fetch():
@@ -263,7 +273,14 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
 
         return await serve(token, fetch)
 
-    mcp._relay = {"queue": queue, "limiter": limiter, "gate": gate, "tdx": tdx, "settings": settings}
+    mcp._relay = {
+        "queue": queue,
+        "limiter": limiter,
+        "meter": meter,
+        "gate": gate,
+        "tdx": tdx,
+        "settings": settings,
+    }
     return mcp
 
 
@@ -276,7 +293,14 @@ def build_app(settings: Optional[Settings] = None):
     async def healthz(_request):  # pragma: no cover - trivial
         from starlette.responses import JSONResponse
 
-        return JSONResponse({"ok": True, **mcp._relay["queue"].stats()})
+        return JSONResponse(
+            {
+                "ok": True,
+                "requests_per_second": round(mcp._relay["meter"].value(), 2),
+                "bypass_below_requests_per_second": mcp._relay["gate"].bypass_threshold,
+                **mcp._relay["queue"].stats(),
+            }
+        )
 
     app = mcp.streamable_http_app(
         stateless_http=True,

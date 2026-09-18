@@ -33,6 +33,10 @@ class Settings:
     upstream_concurrency: int = 8
     cache_ttl: float = 30.0
 
+    # --- Load bypass ----------------------------------------------------
+    bypass_threshold: float = 5.0     # skip the queue below this many requests/s; 0 disables
+    load_window: float = 10.0         # time constant of the moving average, in seconds
+
     # --- Admission queue ----------------------------------------------
     admit_rate: float = 10.0          # tokens admitted per second
     admit_burst: float = 10.0         # unused admission slots that may accumulate
@@ -59,6 +63,8 @@ class Settings:
             upstream_timeout=_env_float("TDX_TIMEOUT", cls.upstream_timeout),
             upstream_concurrency=_env_int("TDX_CONCURRENCY", cls.upstream_concurrency),
             cache_ttl=_env_float("TDX_CACHE_TTL", cls.cache_ttl),
+            bypass_threshold=_env_float("RELAY_BYPASS_THRESHOLD", cls.bypass_threshold),
+            load_window=_env_float("RELAY_LOAD_WINDOW", cls.load_window),
             admit_rate=_env_float("RELAY_ADMIT_RATE", cls.admit_rate),
             admit_burst=_env_float("RELAY_ADMIT_BURST", _env_float("RELAY_ADMIT_RATE", cls.admit_rate)),
             queue_limit=_env_int("RELAY_QUEUE_LIMIT", cls.queue_limit),

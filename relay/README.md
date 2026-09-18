@@ -10,7 +10,17 @@ the calls are billed to that member.
 
 ## How the queue works
 
-Every tool takes an optional `token` argument.
+Every tool takes an optional `token` argument, and the relay only asks for one
+when it is busy.
+
+**While the relay is quiet** — the moving average of requests is below
+`RELAY_BYPASS_THRESHOLD`, 5 per second by default, and nobody is waiting —
+callers are served straight away. No token is minted, nothing is queued, and
+the result carries `"served_directly": true`. Waiting callers veto the bypass:
+letting a newcomer past a line it does not have to join would starve the
+callers already in it.
+
+**Once traffic passes the threshold**, the queue takes over:
 
 1. A call **without a token**, or with a token the relay does not know, is a
    request for a token. The relay mints one, puts it at the back of the line and
@@ -20,8 +30,12 @@ Every tool takes an optional `token` argument.
 3. A call **with an admitted token** is served.
 
 The queue admits **10 tokens per second** in issue order (`RELAY_ADMIT_RATE`).
-When the relay is idle, an arriving caller is admitted on the spot and the new
-token rides along in the result, so a quiet relay costs nobody a round trip.
+A token already in hand keeps working when traffic dies down again, so a caller
+that queued during a rush is never sent back to the end of the line.
+
+The load figure is an exponentially weighted moving average with a 10 second
+time constant (`RELAY_LOAD_WINDOW`): old traffic fades instead of falling off a
+cliff at a window boundary. It is reported by `queue_status` and `/healthz`.
 
 An admitted token stays valid while it is used, and expires one hour after the
 last call (`RELAY_ADMITTED_TTL`). A token that is still waiting after 15 minutes
@@ -33,6 +47,12 @@ background task, position lookup is O(1), and the whole thing is driven by an
 injectable clock, which is what the tests use.
 
 ### Wire format
+
+Served while quiet, with no token in play:
+
+```json
+{"status": "ok", "served_directly": true, "date": "2026-09-18", "trains": [ … ]}
+```
 
 Queued:
 
@@ -49,7 +69,7 @@ Queued:
 }
 ```
 
-Served:
+Served on a token:
 
 ```json
 {"status": "ok", "token": "kA1s…", "date": "2026-09-18", "trains": [ … ]}
@@ -74,7 +94,7 @@ With `0`, the socket peer is used and `X-Forwarded-For` is not read at all.
 
 | Tool | What it returns |
 | ---- | --------------- |
-| `queue_status` | A token, or where an existing token stands |
+| `queue_status` | Whether a token is needed at all, and where an existing one stands |
 | `find_tra_station` / `find_thsr_station` | Station IDs matching a Chinese name |
 | `search_tra_trains` / `search_thsr_trains` | Up to 3 trains for an OD pair and date |
 | `get_tra_fare` / `get_thsr_fare` | Ticket prices for an OD pair |
@@ -112,6 +132,8 @@ claude mcp add --transport http tdx-relay https://<your-host>/mcp
 | `TDX_AUTH_URL` | TDX Keycloak token endpoint | OAuth2 token endpoint |
 | `TDX_CACHE_TTL` | `30` | Seconds an upstream response is reused |
 | `TDX_CONCURRENCY` | `8` | Upstream calls in flight |
+| `RELAY_BYPASS_THRESHOLD` | `5` | Requests per second below which the queue is skipped; `0` disables the bypass |
+| `RELAY_LOAD_WINDOW` | `10` | Time constant of the moving average, in seconds |
 | `RELAY_ADMIT_RATE` | `10` | Tokens admitted per second |
 | `RELAY_ADMIT_BURST` | = admit rate | Admissions an idle relay may bank |
 | `RELAY_ADMITTED_TTL` | `3600` | Idle life of an admitted token |
@@ -138,6 +160,10 @@ claude mcp add --transport http tdx-relay https://<your-host>/mcp
   subscription the relay runs on.
 - **A token is a place in line, not an identity.** It is not authentication and
   says nothing about who the caller is.
+- **Bypassed calls are not charged to any IP bucket.** The per-IP limit guards
+  token issuance, so while the relay is quiet a single IP can use the whole
+  bypass allowance. It is bounded by `RELAY_BYPASS_THRESHOLD`: past that the
+  queue and the per-IP limit both come back into play.
 
 ## Tests
 
@@ -145,7 +171,8 @@ claude mcp add --transport http tdx-relay https://<your-host>/mcp
 pip install -e ".[dev]" && pytest
 ```
 
-`tests/test_admission.py` and `tests/test_ratelimit.py` drive the queue and the
-buckets with a fake clock. `tests/test_server_e2e.py` runs the real server under
+`tests/test_admission.py`, `tests/test_ratelimit.py`, `tests/test_meter.py` and
+`tests/test_gate.py` drive the queue, the buckets, the moving average and the
+bypass with a fake clock. `tests/test_server_e2e.py` runs the real server under
 uvicorn and talks to it with a real MCP client over streamable HTTP, with the
 TDX call stubbed.

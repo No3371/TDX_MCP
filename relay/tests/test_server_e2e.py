@@ -6,6 +6,7 @@ import asyncio
 import json
 import socket
 import threading
+from contextlib import contextmanager
 
 import pytest
 import uvicorn
@@ -36,9 +37,10 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture
-def relay():
-    settings = Settings(
+@contextmanager
+def running(**overrides):
+    """Run the real relay under uvicorn, with the TDX call stubbed out."""
+    defaults = dict(
         client_id="x",
         client_secret="y",
         admit_rate=1.0,
@@ -46,7 +48,9 @@ def relay():
         ip_issue_burst=5.0,
         ip_issue_rate=1.0,
         trusted_proxy_hops=1,
+        bypass_threshold=0.0,   # off by default here, so the queue is exercised
     )
+    settings = Settings(**{**defaults, **overrides})
     mcp = build_server(settings)
 
     calls = []
@@ -77,6 +81,18 @@ def relay():
     finally:
         server.should_exit = True
         thread.join(timeout=5)
+
+
+@pytest.fixture
+def relay():
+    with running() as ctx:
+        yield ctx
+
+
+@pytest.fixture
+def quiet_relay():
+    with running(bypass_threshold=50.0) as ctx:
+        yield ctx
 
 
 async def call(url, name, args, ip="203.0.113.7"):
@@ -138,3 +154,24 @@ async def test_tools_are_listed_with_a_token_argument(relay):
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_a_quiet_relay_serves_without_any_token(quiet_relay):
+    url, _, calls = quiet_relay
+
+    for _ in range(3):
+        result = await call(url, "search_tra_trains", {"origin": "1020", "destination": "1040"})
+        assert result["status"] == "ok"
+        assert result["served_directly"] is True
+        assert "token" not in result
+    assert len(calls) == 3
+
+
+@pytest.mark.anyio
+async def test_queue_status_says_no_token_is_needed_while_quiet(quiet_relay):
+    url, _, _ = quiet_relay
+    result = await call(url, "queue_status", {})
+    assert result["status"] == "open"
+    assert result["bypass_below_requests_per_second"] == 50.0
+    assert "token" not in result
