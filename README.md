@@ -13,6 +13,11 @@
 提供查詢縣市道路、省道與高速公路道路事件查詢。
 [點我觀看更多說明](https://github.com/tdxmotc/MCP/tree/main/Event)。
 
+### 開放式轉送服務(Relay)
+
+另提供一種不同的佈署方式: 由服務方持有TDX API金鑰，任何人皆可直接連線使用，並以「排隊配額」控管流量(每秒放行10個token、依IP限制發放token次數)。
+[點我觀看更多說明](relay/README.md)。
+
 ## 使用方式
 
 先至[TDX官網](https://tdx.transportdata.tw/register)註冊為TDX會員並取得API金鑰。在AI工具上的每次提問，MCP服務會自動使用會員提供的API金鑰呼叫一至多個相關聯的TDX API，每次的呼叫行為皆會計算點數。基礎會員(未訂閱)即可使用MCP服務，但使用量則視會員訂閱方案而訂。不同訂閱方案與TDX API呼叫量限制請參閱[TDX訂閱收費說明](https://tdx.transportdata.tw/pricing)。

@@ -1,0 +1,23 @@
+[project]
+name = "tdx-mcp-relay"
+version = "0.1.0"
+description = "Open MCP relay for TDX transport data, with an admission queue"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.0",
+    "httpx>=0.27",
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+tdx-relay = "tdx_relay.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["tdx_relay"]
