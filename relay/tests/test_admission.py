@@ -97,18 +97,42 @@ def test_unknown_and_forged_tokens_are_not_recognised():
     assert admitter.check(other.issue().token) is None
 
 
-def test_a_token_expires_and_renewal_pushes_it_out():
-    admitter, clock = make(token_ttl=60.0)
+def test_an_unused_admission_window_closes():
+    admitter, clock = make(window=30.0)
     token = admitter.issue().token
-    clock.advance(59.0)
-
-    status = admitter.check(token)
-    assert status.state is State.ADMITTED
-    token = admitter.renew(admitter.claims(token))   # a served call renews it
-
-    clock.advance(59.0)
+    clock.advance(29.0)
     assert admitter.check(token).state is State.ADMITTED
-    clock.advance(61.0)
+
+    clock.advance(2.0)
+    assert admitter.check(token) is None        # late is the same as expired
+    assert admitter.is_stale(token) is True     # but the relay knows it was ours
+
+
+def test_a_served_call_restarts_the_window():
+    admitter, clock = make(window=30.0)
+    token = admitter.issue().token
+    for _ in range(20):
+        clock.advance(29.0)
+        assert admitter.check(token).state is State.ADMITTED
+        token = admitter.renew(admitter.claims(token))
+    clock.advance(31.0)
+    assert admitter.check(token) is None
+
+
+def test_a_forged_token_is_not_called_stale():
+    admitter, clock = make()
+    other = Admitter(TokenSigner(b"another-key", clock=clock), clock=clock)
+    assert admitter.is_stale(other.issue().token) is False
+    assert admitter.is_stale("rubbish") is False
+
+
+def test_a_queued_token_stays_good_until_its_window_closes():
+    admitter, clock = make(rate=1.0, burst=1.0, window=30.0)
+    admitter.issue()
+    token = admitter.issue().token               # admitted one second from now
+    clock.advance(30.5)
+    assert admitter.check(token).state is State.ADMITTED
+    clock.advance(1.0)
     assert admitter.check(token) is None
 
 

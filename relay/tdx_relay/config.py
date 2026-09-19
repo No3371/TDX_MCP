@@ -41,18 +41,19 @@ class Settings:
     admit_rate: float = 10.0          # tokens admitted per second
     admit_burst: float = 10.0         # immediate admissions an idle relay hands out
     max_wait: float = 300.0           # longest wait the relay will promise
-    token_ttl: float = 3600.0         # life of a token, pushed out on every served call
+    admit_window: float = 30.0        # how long an admission stays good, restarted on every served call
     retry_pad: float = 0.2            # padding added to every advertised wait
     token_secret: str = ""            # HMAC key; random per process when unset
     token_key_id: str = "0"
 
     # --- Per-IP limits -------------------------------------------------
-    # Caller faults: asking for a token, polling early, presenting a bad one.
-    ip_fault_burst: float = 20.0
-    ip_fault_rate: float = 1.0
+    # Caller faults: asking for a token, polling early or late, presenting a
+    # bad one.  Strictly tighter than the request bucket, or it never bites.
+    ip_fault_burst: float = 5.0
+    ip_fault_rate: float = 0.2
     # Every request, valid token or not.  Bounds a caller replaying a token.
-    ip_request_burst: float = 50.0
-    ip_request_rate: float = 5.0
+    ip_request_burst: float = 10.0
+    ip_request_rate: float = 1.0
     trusted_proxy_hops: int = 1       # X-Forwarded-For entries to skip from the right
 
     # --- HTTP ----------------------------------------------------------
@@ -74,7 +75,7 @@ class Settings:
             admit_rate=_env_float("RELAY_ADMIT_RATE", cls.admit_rate),
             admit_burst=_env_float("RELAY_ADMIT_BURST", _env_float("RELAY_ADMIT_RATE", cls.admit_rate)),
             max_wait=_env_float("RELAY_MAX_WAIT", cls.max_wait),
-            token_ttl=_env_float("RELAY_TOKEN_TTL", cls.token_ttl),
+            admit_window=_env_float("RELAY_ADMIT_WINDOW", cls.admit_window),
             retry_pad=_env_float("RELAY_RETRY_PAD", cls.retry_pad),
             token_secret=os.environ.get("RELAY_TOKEN_SECRET", ""),
             token_key_id=os.environ.get("RELAY_TOKEN_KEY_ID", cls.token_key_id),

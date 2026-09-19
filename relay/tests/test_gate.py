@@ -1,3 +1,5 @@
+import pytest
+
 from tdx_relay.admission import Admitter
 from tdx_relay.gate import Gate
 from tdx_relay.meter import RateMeter
@@ -74,9 +76,9 @@ def test_the_same_token_is_served_once_its_slot_arrives():
     assert served.payload is None
 
 
-def test_a_served_call_hands_back_a_renewed_token():
+def test_a_served_call_hands_back_a_token_with_a_fresh_window():
     clock = Clock()
-    gate = make_gate(clock, token_ttl=60.0)
+    gate = make_gate(clock, window=60.0)
     token = gate.admit(None, "1.1.1.1").token
     clock.advance(59.0)
 
@@ -84,6 +86,24 @@ def test_a_served_call_hands_back_a_renewed_token():
     assert renewed != token
     clock.advance(59.0)
     assert gate.admit(renewed, "1.1.1.1").admitted is True   # the old one would be dead
+
+
+def test_a_caller_that_comes_back_late_is_charged_and_re_queued():
+    clock = Clock()
+    gate = make_gate(clock, rate=1.0, burst=1.0, window=5.0, fault_burst=5, fault_rate=0.0001)
+    gate.admit(None, "1.1.1.1")                  # someone else holds the first slot
+    token = gate.admit(None, "9.9.9.9").token    # one fault credit for the token
+
+    clock.advance(30.0)                          # the window came and went
+    for _ in range(3):
+        gate.admitter.issue()                    # and the line filled up again
+
+    late = gate.admit(token, "9.9.9.9")
+    assert late.admitted is False
+    assert late.payload["status"] == "queued"
+    assert "window" in late.payload["reason"]
+    assert late.payload["token"] != token        # a new place in line
+    assert gate.faults.peek("9.9.9.9") == pytest.approx(3, abs=0.01)  # charged like any fault
 
 
 def test_a_wait_past_the_horizon_is_refused_as_busy():
@@ -98,13 +118,15 @@ def test_a_wait_past_the_horizon_is_refused_as_busy():
 
 def test_waiting_as_told_costs_one_credit_for_the_whole_session():
     clock = Clock()
-    gate = make_gate(clock, rate=1.0, burst=1.0, fault_burst=2, fault_rate=0.0001)
+    gate = make_gate(clock, rate=1.0, burst=1.0, window=30.0, fault_burst=2, fault_rate=0.0001)
     gate.admit(None, "1.1.1.1")                 # someone else takes the first slot
     token = gate.admit(None, "9.9.9.9").token   # one credit for the token
 
     for _ in range(50):
         clock.advance(2.0)
-        assert gate.admit(token, "9.9.9.9").admitted is True
+        decision = gate.admit(token, "9.9.9.9")
+        assert decision.admitted is True
+        token = decision.token                  # each served call renews the window
     assert gate.faults.peek("9.9.9.9") >= 1     # a patient caller is barely charged
 
 

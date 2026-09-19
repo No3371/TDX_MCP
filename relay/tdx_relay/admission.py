@@ -1,7 +1,7 @@
 """Admission: a tail counter and a signer, and nothing else.
 
-Every token carries the wall clock second at which its holder may be served,
-signed by the relay.  Issuing one moves a single number forward — the tail of
+Every token carries the wall clock second at which its holder may be served and
+the second its admission runs out, signed by the relay.  Issuing one moves a single number forward — the tail of
 the queue — so the relay keeps no record of any token, whatever the length of
 the line.  Checking one is a signature check and a comparison against the
 clock.
@@ -11,6 +11,11 @@ clock.
 
 The first term lets an idle relay hand out ``burst`` immediate admissions; the
 second paces everyone else exactly 1/rate apart.
+
+A token is good from ``admit_at`` until ``admit_at + window``.  Coming back
+late is therefore the same thing as coming back with an expired token: the
+holder books a new slot.  A served call renews the window, so a caller that
+keeps working keeps its place and one that wanders off loses it.
 """
 
 from __future__ import annotations
@@ -50,7 +55,7 @@ class Admitter:
         rate: float = 10.0,
         burst: float = 10.0,
         max_wait: float = 300.0,
-        token_ttl: float = 3600.0,
+        window: float = 30.0,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if rate <= 0:
@@ -59,7 +64,7 @@ class Admitter:
         self.rate = rate
         self.burst = max(burst, 1.0)
         self.max_wait = max_wait
-        self.token_ttl = token_ttl
+        self.window = window
         self._clock = clock
         self._lock = threading.Lock()
         self._tail = 0.0
@@ -74,18 +79,18 @@ class Admitter:
             if wait > self.max_wait:
                 raise QueueFull()
             self._tail = admit_at + 1.0 / self.rate
-        token = self.signer.sign(admit_at, expires_at=max(now, admit_at) + self.token_ttl)
+        token = self.signer.sign(admit_at, expires_at=admit_at + self.window)
         return self._status(token, admit_at, now, new_token=True)
 
     def renew(self, claims: Claims) -> str:
-        """Re-sign an admitted token with its expiry pushed out.
+        """Re-sign a served token with its window restarted from now.
 
-        This is what keeps an idle timeout sliding without storing anything:
-        a token in use is replaced on every served call, and one that stops
-        being used dies on its own.
+        This is what keeps an active caller out of the queue without storing
+        anything: the token is replaced on every served call, and one that
+        stops being used runs out on its own.
         """
         now = self._clock()
-        return self.signer.sign(claims.admit_at, expires_at=now + self.token_ttl)
+        return self.signer.sign(now, expires_at=now + self.window)
 
     # -- checking ---------------------------------------------------------
     def check(self, token: Optional[str]) -> Optional[Status]:
@@ -97,6 +102,12 @@ class Admitter:
 
     def claims(self, token: Optional[str]) -> Optional[Claims]:
         return self.signer.verify(token)
+
+    def is_stale(self, token: Optional[str]) -> bool:
+        """Was this one of ours, whose admission window has since closed?"""
+        return self.signer.verify(token) is None and (
+            self.signer.verify(token, ignore_expiry=True) is not None
+        )
 
     def _status(self, token: str, admit_at: float, now: float, new_token: bool = False) -> Status:
         wait = admit_at - now
@@ -116,4 +127,5 @@ class Admitter:
             "admit_rate_per_second": self.rate,
             "waiting": self.waiting(),
             "max_wait_seconds": self.max_wait,
+            "admission_window_seconds": self.window,
         }

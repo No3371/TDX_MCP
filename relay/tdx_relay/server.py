@@ -50,7 +50,7 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
         rate=settings.admit_rate,
         burst=settings.admit_burst,
         max_wait=settings.max_wait,
-        token_ttl=settings.token_ttl,
+        window=settings.admit_window,
     )
     faults = RateLimiter(burst=settings.ip_fault_burst, rate=settings.ip_fault_rate)
     throughput = RateLimiter(burst=settings.ip_request_burst, rate=settings.ip_request_rate)

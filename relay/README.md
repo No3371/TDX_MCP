@@ -27,7 +27,7 @@ callers already in it.
    a token, the queue position and how long to wait.
 2. A call **with a token whose slot has not come up** gets the same answer, with
    the current position. The upstream TDX API is not touched.
-3. A call **with a token whose slot has passed** is served.
+3. A call **inside its token's admission window** is served.
 
 The queue hands out **10 slots per second** (`RELAY_ADMIT_RATE`), paced exactly
 1/10 s apart, with the first `RELAY_ADMIT_BURST` admitted at once after an idle
@@ -57,10 +57,24 @@ restart or across replicas that share the key. What remains is the tail counter
 Times are wall clock, because a token has to mean the same thing to a process
 that did not issue it. The relay's clock needs NTP.
 
-Every served call hands back a **renewed token** with its expiry pushed out
-(`RELAY_TOKEN_TTL`, one hour). A token in use never dies; one that falls out of
-use dies on its own. That is how the idle timeout slides without storing
-anything.
+### A token is a ticket, not a season pass
+
+A token is good from `admit_at` until `admit_at + RELAY_ADMIT_WINDOW`
+(30 seconds). Every served call hands back a renewed token whose window starts
+again from now, so a caller that keeps working keeps its place, and one that
+wanders off loses it and books a new slot on its next call.
+
+Coming back late therefore needs no rule of its own: a late token is an expired
+token, the signature check rejects it, and the caller is charged a fault and
+re-queued like any other tokenless call. The relay can still tell its own
+expired token from a forged one, so the answer says which it was.
+
+The window is what bounds a replayed token. One hour of unlimited access would
+be worth stealing; thirty seconds, renewed only by calls that the throughput
+bucket already paces, is not. Shorten it (`RELAY_ADMIT_WINDOW=5`) if your
+callers are programmatic; leave it at 30 if an LLM sits in the loop, because a
+model takes seconds to decide its next tool call and every expiry costs its
+caller a fault credit.
 
 ### Wire format
 
@@ -103,14 +117,19 @@ Two token buckets per IP:
 
 | Bucket | Charged for | Default |
 | ------ | ----------- | ------- |
-| **faults** | Anything the caller brought on itself: asking for a token, polling before its slot, presenting a token the relay will not accept | 20 back to back, then 1 per second |
-| **throughput** | Every request, valid token or not | 50 back to back, then 5 per second |
+| **faults** | Anything the caller brought on itself: asking for a token, polling before its slot, letting its window close unused, presenting a token the relay will not accept | 5 back to back, then 1 every 5 seconds |
+| **throughput** | Every request, valid token or not, token requests included | 10 back to back, then 1 per second |
 
-A caller that waits as it was told pays **one** credit for its token and nothing
-after that — served calls and bypassed calls are free. A caller that polls its
-queued token in a tight loop pays for every poll and is shut out in about
-twenty of them. A rate-limited answer still carries the caller's token and its
-position, so being refused does not cost it its place in line.
+A caller that waits as it was told pays **one** fault credit for its token and
+nothing after that — served calls and bypassed calls cost nothing against the
+fault bucket. A caller that polls its queued token in a tight loop pays for
+every poll and is shut out in five of them. A rate-limited answer still carries
+the caller's token and its position, so being refused does not cost it its
+place in line.
+
+The fault bucket has to stay **strictly tighter** than the throughput bucket.
+Loosen it past 1 per second and the throughput bucket always fires first, which
+leaves the fault rule doing nothing at all.
 
 **A failure of the upstream API is never charged.** An outage at TDX makes every
 response a non-success; charging those would lock callers out of the relay on
@@ -170,15 +189,15 @@ claude mcp add --transport http tdx-relay https://<your-host>/mcp
 | `TDX_CONCURRENCY` | `8` | Upstream calls in flight |
 | `RELAY_TOKEN_SECRET` | random per process | HMAC key for tokens. **Set it**: unset means every token dies on restart and a second replica rejects them all |
 | `RELAY_TOKEN_KEY_ID` | `0` | Key id carried in the token, for rotation |
-| `RELAY_TOKEN_TTL` | `3600` | Life of a token, pushed out on every served call |
+| `RELAY_ADMIT_WINDOW` | `30` | How long an admission stays good; restarted by every served call |
 | `RELAY_BYPASS_THRESHOLD` | `5` | Requests per second below which the queue is skipped; `0` disables the bypass |
 | `RELAY_LOAD_WINDOW` | `10` | Time constant of the moving average, in seconds |
 | `RELAY_ADMIT_RATE` | `10` | Slots handed out per second |
 | `RELAY_ADMIT_BURST` | = admit rate | Immediate admissions after an idle period |
 | `RELAY_MAX_WAIT` | `300` | Longest wait the relay will promise before answering `busy` |
 | `RELAY_RETRY_PAD` | `0.2` | Padding added to every advertised wait |
-| `RELAY_IP_FAULT_BURST`, `RELAY_IP_FAULT_RATE` | `20`, `1` | Per-IP bucket for caller faults |
-| `RELAY_IP_REQUEST_BURST`, `RELAY_IP_REQUEST_RATE` | `50`, `5` | Per-IP bucket for all requests |
+| `RELAY_IP_FAULT_BURST`, `RELAY_IP_FAULT_RATE` | `5`, `0.2` | Per-IP bucket for caller faults |
+| `RELAY_IP_REQUEST_BURST`, `RELAY_IP_REQUEST_RATE` | `10`, `1` | Per-IP bucket for all requests |
 | `RELAY_TRUSTED_PROXY_HOPS` | `1` | Proxies in front of the relay |
 | `RELAY_ALLOWED_HOSTS`, `RELAY_ALLOWED_ORIGINS` | unset | Comma separated; unset turns DNS rebinding protection off |
 | `RELAY_HOST`, `RELAY_PORT` | `0.0.0.0`, `8080` | Listen address |
@@ -196,7 +215,7 @@ right, only the ordering between replicas is approximate.
 
 Signing with a new key id invalidates every token signed with the old one,
 which is the only way to revoke tokens in bulk. To rotate without dumping
-everyone back in line, keep the old secret loadable for `RELAY_TOKEN_TTL` after
+everyone back in line, keep the old secret loadable for one `RELAY_ADMIT_WINDOW` plus `RELAY_MAX_WAIT` after
 the change — `TokenSigner` takes a `retired` mapping of key id to secret for
 exactly that.
 
@@ -208,7 +227,11 @@ exactly that.
   cut off one abuser, the lever is the IP buckets, not the token.
 - **A token can be shared.** Nothing binds it to a caller. Binding it to an IP
   was considered and rejected: NAT and mobile hand-offs break it, and it
-  protects little. The throughput bucket is the bound that matters.
+  protects little. The admission window and the throughput bucket are the
+  bounds that matter.
+- **Shared IPs share the buckets.** Everyone behind one NAT or corporate proxy
+  draws on the same 1 request per second. Raise `RELAY_IP_REQUEST_*` if the
+  relay serves such callers, or the first user shuts out the rest.
 - **Wall clock matters.** `admit_at` is an absolute time, so a relay with a
   wrong clock admits everyone early or nobody at all, and replicas that disagree
   on the time disagree on the queue.

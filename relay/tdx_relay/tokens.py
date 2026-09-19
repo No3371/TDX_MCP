@@ -74,8 +74,13 @@ class TokenSigner:
         body = f"{PREFIX}.{self.key_id}.{_b64(payload)}"
         return f"{body}.{_b64(self._mac(self.key_id, body))}"
 
-    def verify(self, token: Optional[str]) -> Optional[Claims]:
-        """Return the claims, or None if the token is malformed, forged or expired."""
+    def verify(self, token: Optional[str], ignore_expiry: bool = False) -> Optional[Claims]:
+        """Return the claims, or None if the token is malformed, forged or expired.
+
+        ``ignore_expiry`` returns the claims of a token that is genuine but out
+        of date, which is how the relay tells "your window closed" from
+        "this is not one of ours".
+        """
         if not token or not isinstance(token, str):
             return None
         parts = token.split(".")
@@ -97,7 +102,7 @@ class TokenSigner:
             admit_ms, expires_ms, nonce = struct.unpack(_PACK, payload)
         except struct.error:
             return None
-        if self._clock() > expires_ms / 1000:
+        if not ignore_expiry and self._clock() > expires_ms / 1000:
             return None
         return Claims(admit_ms / 1000, expires_ms / 1000, _b64(nonce.rstrip(b"\0")))
 

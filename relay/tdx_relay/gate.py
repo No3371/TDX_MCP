@@ -3,8 +3,9 @@
 Two per-IP buckets guard it:
 
 * **faults** — charged for anything the caller brought on itself: asking for a
-  token, polling before its admission time, presenting a bad token.  A caller
-  that waits as it was told pays once for its token and nothing after that.
+  token, polling before its admission time, letting its admission window close
+  unused, presenting a bad token.  A caller that waits as it was told pays once
+  for its token and nothing after that.
   A failure of the upstream API is never charged: an outage at TDX must not
   lock callers out of the relay as well.
 * **throughput** — charged for every request, with a much larger allowance.
@@ -23,9 +24,9 @@ from .meter import RateMeter
 from .ratelimit import RateLimiter
 
 _WAIT_HINT = (
-    "Call the same tool again with this token after the wait. Keep the token: "
-    "it holds your place in line. Calling back early costs you against this "
-    "IP address's limit."
+    "Call the same tool again with this token after the wait, and within the "
+    "admission window that follows. Calling back early, or too late, costs you "
+    "against this IP address's limit and books you a new slot."
 )
 
 
@@ -93,6 +94,7 @@ class Gate:
         if status is not None:
             return Decision(False, status.token, False, False, self._queued(status))
 
+        stale = self.admitter.is_stale(token)
         try:
             status = self.admitter.issue()
         except QueueFull:
@@ -110,11 +112,11 @@ class Gate:
 
         if status.state is State.ADMITTED:
             return Decision(True, status.token, True)
-        return Decision(False, status.token, True, False, self._queued(status))
+        return Decision(False, status.token, True, False, self._queued(status, stale))
 
     # -- payloads ---------------------------------------------------------
-    def _queued(self, status) -> Dict[str, Any]:
-        return {
+    def _queued(self, status, stale: bool = False) -> Dict[str, Any]:
+        payload = {
             "status": "queued",
             "token": status.token,
             "new_token": status.new_token,
@@ -124,6 +126,12 @@ class Gate:
             "admit_rate_per_second": self.admitter.rate,
             "hint": _WAIT_HINT,
         }
+        if stale:
+            payload["reason"] = (
+                f"the admission window of {self.admitter.window:.0f} seconds closed "
+                "unused, so this is a new place in line"
+            )
+        return payload
 
     def _refused(self, reason: str, retry_after: float, token: Optional[str]) -> Decision:
         payload: Dict[str, Any] = {
