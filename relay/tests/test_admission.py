@@ -1,11 +1,14 @@
+import math
+
 import pytest
 
-from tdx_relay.admission import AdmissionQueue, QueueFull, State
+from tdx_relay.admission import Admitter, QueueFull, State
+from tdx_relay.tokens import TokenSigner
 
 
 class Clock:
-    def __init__(self):
-        self.now = 1000.0
+    def __init__(self, now=1_700_000_000.0):
+        self.now = now
 
     def __call__(self):
         return self.now
@@ -14,90 +17,114 @@ class Clock:
         self.now += seconds
 
 
-def make_queue(**kwargs):
+def make(**kwargs):
     clock = Clock()
     kwargs.setdefault("rate", 10.0)
-    return AdmissionQueue(clock=clock, **kwargs), clock
+    kwargs.setdefault("burst", 10.0)
+    signer = TokenSigner(b"test-key", clock=clock)
+    return Admitter(signer, clock=clock, **kwargs), clock
 
 
-def test_first_tokens_are_admitted_from_the_burst():
-    queue, _ = make_queue()
-    statuses = [queue.issue("1.1.1.1") for _ in range(10)]
+def test_an_idle_relay_admits_the_burst_at_once():
+    admitter, _ = make()
+    statuses = [admitter.issue() for _ in range(10)]
     assert all(s.state is State.ADMITTED for s in statuses)
     assert all(s.new_token for s in statuses)
 
 
-def test_eleventh_token_waits_and_reports_its_position():
-    queue, clock = make_queue()
+def test_the_rest_are_paced_one_slot_apart():
+    admitter, clock = make()
     for _ in range(10):
-        queue.issue("1.1.1.1")
-    first = queue.issue("1.1.1.1")
-    second = queue.issue("1.1.1.1")
+        admitter.issue()
+
+    first = admitter.issue()
+    second = admitter.issue()
     assert first.state is State.QUEUED
     assert (first.position, second.position) == (1, 2)
-    assert first.eta_seconds == pytest.approx(0.1)
+    # Sub-millisecond precision is lost: a token carries whole milliseconds.
+    assert first.eta_seconds == pytest.approx(0.1, abs=0.002)
+    assert second.eta_seconds == pytest.approx(0.2, abs=0.002)
 
     clock.advance(1.0)
-    assert queue.check(first.token).state is State.ADMITTED
-    assert queue.check(second.token).state is State.ADMITTED
+    assert admitter.check(first.token).state is State.ADMITTED
+    assert admitter.check(second.token).state is State.ADMITTED
 
 
 def test_admits_exactly_ten_per_second():
-    queue, clock = make_queue()
-    tokens = [queue.issue("1.1.1.1").token for _ in range(35)]
-    # 10 admitted from the burst, 25 waiting.
-    assert sum(queue.check(t).state is State.ADMITTED for t in tokens) == 10
+    admitter, clock = make()
+    tokens = [admitter.issue().token for _ in range(35)]
+    admitted = lambda: sum(admitter.check(t).state is State.ADMITTED for t in tokens)
+    assert admitted() == 10          # the burst
     clock.advance(1.0)
-    assert sum(queue.check(t).state is State.ADMITTED for t in tokens) == 20
+    assert admitted() == 20
     clock.advance(1.5)
-    assert sum(queue.check(t).state is State.ADMITTED for t in tokens) == 35
+    assert admitted() == 35
 
 
-def test_idle_credits_do_not_pile_up_past_the_burst():
-    queue, clock = make_queue()
+def test_idle_time_does_not_bank_more_than_the_burst():
+    admitter, clock = make()
     clock.advance(600.0)
-    tokens = [queue.issue("1.1.1.1").token for _ in range(20)]
-    assert sum(queue.check(t).state is State.ADMITTED for t in tokens) == 10
+    tokens = [admitter.issue().token for _ in range(20)]
+    assert sum(admitter.check(t).state is State.ADMITTED for t in tokens) == 10
 
 
-def test_unknown_token_is_not_recognised():
-    queue, _ = make_queue()
-    assert queue.check("nope") is None
-    assert queue.check(None) is None
-    assert queue.check("") is None
+def test_the_relay_stores_nothing_per_token():
+    admitter, _ = make()
+    for _ in range(1000):
+        admitter.issue()
+    assert admitter.__dict__.keys() >= {"_tail"}
+    assert not any(isinstance(v, (dict, list, set)) for v in admitter.__dict__.values())
 
 
-def test_admitted_token_expires_after_idle_ttl():
-    queue, clock = make_queue(admitted_ttl=60.0)
-    token = queue.issue("1.1.1.1").token
+def test_a_token_outlives_a_restart():
+    admitter, clock = make()
+    for _ in range(50):
+        admitter.issue()
+    token = admitter.issue().token
+
+    restarted = Admitter(TokenSigner(b"test-key", clock=clock), rate=10.0, clock=clock)
+    assert restarted.check(token).state is State.QUEUED
+    clock.advance(30.0)
+    assert restarted.check(token).state is State.ADMITTED
+
+
+def test_unknown_and_forged_tokens_are_not_recognised():
+    admitter, clock = make()
+    assert admitter.check(None) is None
+    assert admitter.check("") is None
+    assert admitter.check("t1.0.AAAA.BBBB") is None
+    other = Admitter(TokenSigner(b"another-key", clock=clock), clock=clock)
+    assert admitter.check(other.issue().token) is None
+
+
+def test_a_token_expires_and_renewal_pushes_it_out():
+    admitter, clock = make(token_ttl=60.0)
+    token = admitter.issue().token
     clock.advance(59.0)
-    assert queue.check(token).state is State.ADMITTED  # refreshes last_seen
+
+    status = admitter.check(token)
+    assert status.state is State.ADMITTED
+    token = admitter.renew(admitter.claims(token))   # a served call renews it
+
     clock.advance(59.0)
-    assert queue.check(token).state is State.ADMITTED
+    assert admitter.check(token).state is State.ADMITTED
     clock.advance(61.0)
-    assert queue.check(token) is None
+    assert admitter.check(token) is None
 
 
-def test_abandoned_waiting_token_is_dropped():
-    queue, clock = make_queue(rate=1.0, queued_ttl=30.0)
-    tokens = [queue.issue("1.1.1.1").token for _ in range(100)]
-    far_back = tokens[-1]
-    assert queue.check(far_back).state is State.QUEUED
-    clock.advance(31.0)
-    assert queue.check(far_back) is None
-
-
-def test_queue_limit_is_enforced():
-    queue, _ = make_queue(rate=1.0, queue_limit=2)
-    queue.issue("1.1.1.1")  # admitted straight away
-    queue.issue("1.1.1.1")
-    queue.issue("1.1.1.1")
+def test_a_wait_past_the_horizon_is_refused():
+    admitter, _ = make(rate=1.0, burst=1.0, max_wait=5.0)
+    for _ in range(6):
+        admitter.issue()
     with pytest.raises(QueueFull):
-        queue.issue("1.1.1.1")
+        admitter.issue()
 
 
-def test_tokens_are_unique_and_opaque():
-    queue, _ = make_queue()
-    tokens = {queue.issue("1.1.1.1").token for _ in range(50)}
-    assert len(tokens) == 50
-    assert all(len(t) >= 24 for t in tokens)
+def test_waiting_counts_the_booked_slots():
+    admitter, clock = make(rate=10.0, burst=10.0)
+    assert admitter.waiting() == 0
+    for _ in range(30):
+        admitter.issue()
+    assert admitter.waiting() == pytest.approx(20, abs=1)
+    clock.advance(1.0)
+    assert admitter.waiting() == pytest.approx(10, abs=1)

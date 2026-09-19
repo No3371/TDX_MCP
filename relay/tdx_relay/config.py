@@ -39,14 +39,20 @@ class Settings:
 
     # --- Admission queue ----------------------------------------------
     admit_rate: float = 10.0          # tokens admitted per second
-    admit_burst: float = 10.0         # unused admission slots that may accumulate
-    queue_limit: int = 100_000        # refuse to issue beyond this many waiting tokens
-    admitted_ttl: float = 3600.0      # idle admitted token expires after this
-    queued_ttl: float = 900.0         # abandoned waiting token is forgotten after this
+    admit_burst: float = 10.0         # immediate admissions an idle relay hands out
+    max_wait: float = 300.0           # longest wait the relay will promise
+    token_ttl: float = 3600.0         # life of a token, pushed out on every served call
+    retry_pad: float = 0.2            # padding added to every advertised wait
+    token_secret: str = ""            # HMAC key; random per process when unset
+    token_key_id: str = "0"
 
-    # --- Per-IP limit on token issuance -------------------------------
-    ip_issue_burst: float = 3.0       # tokens an IP may request back to back
-    ip_issue_rate: float = 0.1        # sustained issuance rate per IP (per second)
+    # --- Per-IP limits -------------------------------------------------
+    # Caller faults: asking for a token, polling early, presenting a bad one.
+    ip_fault_burst: float = 20.0
+    ip_fault_rate: float = 1.0
+    # Every request, valid token or not.  Bounds a caller replaying a token.
+    ip_request_burst: float = 50.0
+    ip_request_rate: float = 5.0
     trusted_proxy_hops: int = 1       # X-Forwarded-For entries to skip from the right
 
     # --- HTTP ----------------------------------------------------------
@@ -67,11 +73,15 @@ class Settings:
             load_window=_env_float("RELAY_LOAD_WINDOW", cls.load_window),
             admit_rate=_env_float("RELAY_ADMIT_RATE", cls.admit_rate),
             admit_burst=_env_float("RELAY_ADMIT_BURST", _env_float("RELAY_ADMIT_RATE", cls.admit_rate)),
-            queue_limit=_env_int("RELAY_QUEUE_LIMIT", cls.queue_limit),
-            admitted_ttl=_env_float("RELAY_ADMITTED_TTL", cls.admitted_ttl),
-            queued_ttl=_env_float("RELAY_QUEUED_TTL", cls.queued_ttl),
-            ip_issue_burst=_env_float("RELAY_IP_BURST", cls.ip_issue_burst),
-            ip_issue_rate=_env_float("RELAY_IP_RATE", cls.ip_issue_rate),
+            max_wait=_env_float("RELAY_MAX_WAIT", cls.max_wait),
+            token_ttl=_env_float("RELAY_TOKEN_TTL", cls.token_ttl),
+            retry_pad=_env_float("RELAY_RETRY_PAD", cls.retry_pad),
+            token_secret=os.environ.get("RELAY_TOKEN_SECRET", ""),
+            token_key_id=os.environ.get("RELAY_TOKEN_KEY_ID", cls.token_key_id),
+            ip_fault_burst=_env_float("RELAY_IP_FAULT_BURST", cls.ip_fault_burst),
+            ip_fault_rate=_env_float("RELAY_IP_FAULT_RATE", cls.ip_fault_rate),
+            ip_request_burst=_env_float("RELAY_IP_REQUEST_BURST", cls.ip_request_burst),
+            ip_request_rate=_env_float("RELAY_IP_REQUEST_RATE", cls.ip_request_rate),
             trusted_proxy_hops=_env_int("RELAY_TRUSTED_PROXY_HOPS", cls.trusted_proxy_hops),
             host=os.environ.get("RELAY_HOST", cls.host),
             port=_env_int("RELAY_PORT", cls.port),

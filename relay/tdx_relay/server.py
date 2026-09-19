@@ -2,11 +2,13 @@
 
 Anyone may connect.  The relay holds the TDX credential, so access is paced by
 an admission queue instead of by per-caller API keys: a call without a valid
-token gets a token minted and queued, and the queue admits N tokens per second.
+token gets a signed token naming the second at which it may be served, and the
+queue hands out N such slots per second.
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
@@ -15,13 +17,16 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
 from . import paths, projection
-from .admission import AdmissionQueue
+from .admission import Admitter
 from .config import Settings
 from .gate import Gate
 from .http import ClientIPMiddleware, client_ip
 from .meter import RateMeter
+from .tokens import TokenSigner
 from .ratelimit import RateLimiter
 from .tdx import TDXClient, UpstreamError
+
+logger = logging.getLogger(__name__)
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 
@@ -31,16 +36,33 @@ def _today() -> str:
 
 def build_server(settings: Optional[Settings] = None) -> MCPServer:
     settings = settings or Settings.from_env()
-    queue = AdmissionQueue(
+    signer = TokenSigner(
+        secret=settings.token_secret.encode("utf-8") if settings.token_secret else None,
+        key_id=settings.token_key_id,
+    )
+    if not settings.token_secret:
+        logger.warning(
+            "RELAY_TOKEN_SECRET is not set: tokens are signed with a random key, "
+            "so every token dies on restart and a second replica rejects them all."
+        )
+    admitter = Admitter(
+        signer,
         rate=settings.admit_rate,
         burst=settings.admit_burst,
-        admitted_ttl=settings.admitted_ttl,
-        queued_ttl=settings.queued_ttl,
-        queue_limit=settings.queue_limit,
+        max_wait=settings.max_wait,
+        token_ttl=settings.token_ttl,
     )
-    limiter = RateLimiter(burst=settings.ip_issue_burst, rate=settings.ip_issue_rate)
+    faults = RateLimiter(burst=settings.ip_fault_burst, rate=settings.ip_fault_rate)
+    throughput = RateLimiter(burst=settings.ip_request_burst, rate=settings.ip_request_rate)
     meter = RateMeter(window=settings.load_window)
-    gate = Gate(queue, limiter, meter, bypass_threshold=settings.bypass_threshold)
+    gate = Gate(
+        admitter,
+        faults,
+        throughput,
+        meter,
+        bypass_threshold=settings.bypass_threshold,
+        retry_pad=settings.retry_pad,
+    )
     tdx = TDXClient(settings)
 
     mcp = MCPServer(
@@ -78,7 +100,7 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
         """Check whether the relay needs a token right now, and get one if so.
 
         Args:
-            token: Queue token, if an earlier call returned one. Omit it otherwise. Omit it unless the relay asked for one.
+            token: Queue token, if an earlier call returned one. Omit it otherwise.
         """
         decision = gate.admit(token, client_ip())
         if not decision.admitted:
@@ -89,14 +111,14 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
                 "message": "The relay is quiet, so no token is needed. Call the tools directly.",
                 "requests_per_second": round(gate.load(), 2),
                 "bypass_below_requests_per_second": gate.bypass_threshold,
-                **queue.stats(),
+                **admitter.stats(),
             }
         return {
             "status": "admitted",
             "token": decision.token,
             "new_token": decision.new_token,
             "requests_per_second": round(gate.load(), 2),
-            **queue.stats(),
+            **admitter.stats(),
         }
 
     # -- TRA ------------------------------------------------------------
@@ -274,8 +296,9 @@ def build_server(settings: Optional[Settings] = None) -> MCPServer:
         return await serve(token, fetch)
 
     mcp._relay = {
-        "queue": queue,
-        "limiter": limiter,
+        "admitter": admitter,
+        "faults": faults,
+        "throughput": throughput,
         "meter": meter,
         "gate": gate,
         "tdx": tdx,
@@ -298,7 +321,7 @@ def build_app(settings: Optional[Settings] = None):
                 "ok": True,
                 "requests_per_second": round(mcp._relay["meter"].value(), 2),
                 "bypass_below_requests_per_second": mcp._relay["gate"].bypass_threshold,
-                **mcp._relay["queue"].stats(),
+                **mcp._relay["admitter"].stats(),
             }
         )
 

@@ -1,25 +1,28 @@
-"""FIFO admission queue.
+"""Admission: a tail counter and a signer, and nothing else.
 
-A caller that has no valid token gets one minted and put at the back of the
-queue.  The queue releases at most ``rate`` tokens per second, in issue order.
-A token is admitted as soon as the queue has drained past it; from then on the
-same token serves data until it goes idle for ``admitted_ttl`` seconds.
+Every token carries the wall clock second at which its holder may be served,
+signed by the relay.  Issuing one moves a single number forward — the tail of
+the queue — so the relay keeps no record of any token, whatever the length of
+the line.  Checking one is a signature check and a comparison against the
+clock.
 
-Admission is computed lazily instead of by a background task: every token
-carries the sequence number it was issued with, and a token is admitted when
-its sequence number is below the queue's drain watermark.  That makes both the
-position lookup and the admission itself O(1), and makes the whole thing
-testable with an injected clock.
+    admit_at = max(now - (burst - 1)/rate, tail)
+    tail     = admit_at + 1/rate
+
+The first term lets an idle relay hand out ``burst`` immediate admissions; the
+second paces everyone else exactly 1/rate apart.
 """
 
 from __future__ import annotations
 
-import secrets
+import math
 import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, Optional
+from typing import Callable, Optional
+
+from .tokens import Claims, TokenSigner
 
 
 class State(str, Enum):
@@ -27,13 +30,8 @@ class State(str, Enum):
     ADMITTED = "admitted"
 
 
-@dataclass
-class Ticket:
-    token: str
-    seq: int
-    issued_at: float
-    last_seen: float
-    ip: str
+class QueueFull(Exception):
+    """The wait would be longer than the relay is willing to promise."""
 
 
 @dataclass(frozen=True)
@@ -45,126 +43,77 @@ class Status:
     new_token: bool = False
 
 
-class QueueFull(Exception):
-    """Raised when the waiting line is longer than the configured limit."""
-
-
-class AdmissionQueue:
+class Admitter:
     def __init__(
         self,
+        signer: Optional[TokenSigner] = None,
         rate: float = 10.0,
-        burst: Optional[float] = None,
-        admitted_ttl: float = 3600.0,
-        queued_ttl: float = 900.0,
-        queue_limit: int = 100_000,
-        clock: Callable[[], float] = time.monotonic,
+        burst: float = 10.0,
+        max_wait: float = 300.0,
+        token_ttl: float = 3600.0,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if rate <= 0:
             raise ValueError("rate must be positive")
+        self.signer = signer or TokenSigner(clock=clock)
         self.rate = rate
-        self.burst = rate if burst is None else max(burst, 1.0)
-        self.admitted_ttl = admitted_ttl
-        self.queued_ttl = queued_ttl
-        self.queue_limit = queue_limit
+        self.burst = max(burst, 1.0)
+        self.max_wait = max_wait
+        self.token_ttl = token_ttl
         self._clock = clock
-
         self._lock = threading.Lock()
-        self._tickets: Dict[str, Ticket] = {}
-        self._issued = 0        # sequence numbers handed out so far
-        self._admitted = 0      # drain watermark: seq < _admitted is admitted
-        self._credits = self.burst
-        self._was_empty = True
-        self._last_drain = clock()
-        self._last_sweep = clock()
+        self._tail = 0.0
 
-    # -- internals ------------------------------------------------------
-    def _drain(self) -> None:
-        """Move the watermark forward by whatever the rate has earned."""
+    # -- issuing ---------------------------------------------------------
+    def issue(self) -> Status:
+        """Take the next slot in line and sign a token for it."""
         now = self._clock()
-        elapsed = max(0.0, now - self._last_drain)
-        self._last_drain = now
-        self._credits += elapsed * self.rate
-        if self._was_empty:
-            # Idle time may not bank more than one burst: a queue nobody is
-            # standing in does not earn admissions for a future crowd.
-            self._credits = min(self._credits, self.burst)
-
-        waiting = self._issued - self._admitted
-        grant = min(int(self._credits), waiting)
-        if grant > 0:
-            self._admitted += grant
-            self._credits -= grant
-        self._was_empty = self._issued == self._admitted
-
-    def _expired_locked(self, ticket: Ticket) -> bool:
-        now = self._clock()
-        if ticket.seq < self._admitted:
-            return now - ticket.last_seen > self.admitted_ttl
-        return now - ticket.issued_at > self.queued_ttl
-
-    def _sweep_locked(self, force: bool = False) -> None:
-        now = self._clock()
-        if not force and now - self._last_sweep < 30.0:
-            return
-        self._last_sweep = now
-        stale = [token for token, t in self._tickets.items() if self._expired_locked(t)]
-        for token in stale:
-            del self._tickets[token]
-
-    def _status_locked(self, ticket: Ticket) -> Status:
-        if ticket.seq < self._admitted:
-            return Status(State.ADMITTED, ticket.token, 0, 0.0)
-        position = ticket.seq - self._admitted + 1
-        return Status(State.QUEUED, ticket.token, position, position / self.rate)
-
-    # -- public API -----------------------------------------------------
-    def issue(self, ip: str = "") -> Status:
-        """Mint a token and put it at the back of the queue."""
         with self._lock:
-            self._drain()
-            self._sweep_locked()
-            if self._issued - self._admitted >= self.queue_limit:
+            admit_at = max(now - (self.burst - 1.0) / self.rate, self._tail)
+            wait = admit_at - now
+            if wait > self.max_wait:
                 raise QueueFull()
-            now = self._clock()
-            token = secrets.token_urlsafe(24)
-            ticket = Ticket(token=token, seq=self._issued, issued_at=now, last_seen=now, ip=ip)
-            self._issued += 1
-            self._tickets[token] = ticket
-            # Drain again so a caller arriving to an idle relay is served at
-            # once instead of being told to wait for a queue of one.
-            self._drain()
-            status = self._status_locked(ticket)
-            return Status(status.state, status.token, status.position, status.eta_seconds, True)
+            self._tail = admit_at + 1.0 / self.rate
+        token = self.signer.sign(admit_at, expires_at=max(now, admit_at) + self.token_ttl)
+        return self._status(token, admit_at, now, new_token=True)
 
+    def renew(self, claims: Claims) -> str:
+        """Re-sign an admitted token with its expiry pushed out.
+
+        This is what keeps an idle timeout sliding without storing anything:
+        a token in use is replaced on every served call, and one that stops
+        being used dies on its own.
+        """
+        now = self._clock()
+        return self.signer.sign(claims.admit_at, expires_at=now + self.token_ttl)
+
+    # -- checking ---------------------------------------------------------
     def check(self, token: Optional[str]) -> Optional[Status]:
-        """Look up a token.  ``None`` means unknown, expired or malformed."""
-        if not token:
+        """Look up a token.  ``None`` means malformed, forged or expired."""
+        claims = self.signer.verify(token)
+        if claims is None:
             return None
-        with self._lock:
-            self._drain()
-            self._sweep_locked()
-            ticket = self._tickets.get(token)
-            if ticket is None:
-                return None
-            if self._expired_locked(ticket):
-                del self._tickets[token]
-                return None
-            ticket.last_seen = self._clock()
-            return self._status_locked(ticket)
+        return self._status(token, claims.admit_at, self._clock())
 
+    def claims(self, token: Optional[str]) -> Optional[Claims]:
+        return self.signer.verify(token)
+
+    def _status(self, token: str, admit_at: float, now: float, new_token: bool = False) -> Status:
+        wait = admit_at - now
+        if wait <= 0.0:
+            return Status(State.ADMITTED, token, 0, 0.0, new_token)
+        return Status(State.QUEUED, token, math.ceil(wait * self.rate), wait, new_token)
+
+    # -- reporting ---------------------------------------------------------
     def waiting(self) -> int:
-        """How many tokens are still in line."""
+        """How many slots are booked beyond now."""
+        now = self._clock()
         with self._lock:
-            self._drain()
-            return self._issued - self._admitted
+            return max(0, math.ceil((self._tail - now) * self.rate))
 
     def stats(self) -> dict:
-        with self._lock:
-            self._drain()
-            return {
-                "admit_rate_per_second": self.rate,
-                "waiting": self._issued - self._admitted,
-                "issued_total": self._issued,
-                "admitted_total": self._admitted,
-                "live_tokens": len(self._tickets),
-            }
+        return {
+            "admit_rate_per_second": self.rate,
+            "waiting": self.waiting(),
+            "max_wait_seconds": self.max_wait,
+        }

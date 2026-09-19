@@ -45,8 +45,11 @@ def running(**overrides):
         client_secret="y",
         admit_rate=1.0,
         admit_burst=1.0,
-        ip_issue_burst=5.0,
-        ip_issue_rate=1.0,
+        ip_fault_burst=5.0,
+        ip_fault_rate=0.0001,
+        ip_request_burst=1000.0,
+        ip_request_rate=1000.0,
+        token_secret="e2e-test-key",
         trusted_proxy_hops=1,
         bypass_threshold=0.0,   # off by default here, so the queue is exercised
     )
@@ -122,12 +125,15 @@ async def test_queue_then_serve(relay):
     await asyncio.sleep(1.1)
     third = await call(url, "search_tra_trains", {"origin": "1020", "destination": "1040", "token": token})
     assert third["status"] == "ok"
-    assert third["token"] == token
+    assert third["token"] != token          # every served call renews the token
     assert len(calls) == 2
+
+    fourth = await call(url, "search_tra_trains", {"origin": "1020", "destination": "1040", "token": third["token"]})
+    assert fourth["status"] == "ok"
 
 
 @pytest.mark.anyio
-async def test_ip_limit_counts_token_requests_per_ip(relay):
+async def test_caller_faults_are_charged_per_ip(relay):
     url, mcp, _ = relay
     for _ in range(5):
         await call(url, "queue_status", {}, ip="198.51.100.1")
@@ -136,6 +142,21 @@ async def test_ip_limit_counts_token_requests_per_ip(relay):
 
     other = await call(url, "queue_status", {}, ip="198.51.100.2")
     assert other["status"] in {"queued", "admitted"}
+
+
+@pytest.mark.anyio
+async def test_a_token_survives_a_restart_of_the_relay(relay):
+    url, _, _ = relay
+    await call(url, "queue_status", {})                    # takes the first slot
+    queued = await call(url, "queue_status", {})
+    assert queued["status"] == "queued"
+    token = queued["token"]
+
+    # A second relay process, same signing key, no shared memory.
+    with running(admit_rate=1.0, token_secret="e2e-test-key") as (other_url, _, _):
+        await asyncio.sleep(1.2)
+        served = await call(other_url, "search_tra_trains", {"origin": "1", "destination": "2", "token": token})
+    assert served["status"] == "ok"
 
 
 @pytest.mark.anyio
